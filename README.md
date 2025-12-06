@@ -101,15 +101,16 @@ feature_eng_research/
 
 ### Feature Engineering Pipeline
 
-The `feature_engineering.py` script supports both single-file and batch processing modes.
+The `feature_engineering.py` script processes a single CSV file at a time.
 
 #### Configuration
 
 Edit the configuration section at the top of `feature_engineering.py`:
 
 ```python
-# Processing mode: "single" or "batch"
-MODE = "batch"
+# Input path
+INPUT_CSV = "data/real_data/abalone/train/abalone_train.csv"
+TASK_TYPE = "regression"  # Options: "classification" | "regression"
 
 # Feature selection method: "mi", "tree", or "random"
 FEATURE_SELECTION_METHOD = "mi"
@@ -117,34 +118,33 @@ FEATURE_SELECTION_METHOD = "mi"
 # Number of top features to select
 TOP_K_NUMERIC_FEATURES = 5
 
-# Transform tier: 0 (No FE) or 1 (Full FE)
-TRANSFORM_TIER = 1
+# Random seed for reproducibility
+RANDOM_SEED = 42
 
 # Optional log1p transform (ablation)
 USE_LOG1P = False
 ```
 
+**Important Notes:**
+- **Target column**: Always the rightmost column in the DataFrame. Ensure your target is in the rightmost position.
+- **Task type**: Must be manually specified as `"classification"` or `"regression"` for each dataset.
+- **Output path**: Automatically generated based on input path and configuration. Format: `data/FE_train_data/{dataset_name}/FE_{dataset_name}_train_{method}_k{top_k}_seed{seed}[_log1p].csv`
+- **Transforms**: Always applies Full FE (squares + pairwise products). No transform tier needed - baseline (no FE) data comes from train/test splits.
+
 #### Running the Pipeline
 
-**Batch Mode** (processes all datasets):
-```bash
-python feature_engineering.py
-```
-
-**Single File Mode**:
-1. Set `MODE = "single"`
-2. Configure `SINGLE_INPUT_CSV`, `SINGLE_OUTPUT_CSV`, and `SINGLE_METADATA_JSON`
-3. Run: `python feature_engineering.py`
+1. Configure `INPUT_CSV` and `TASK_TYPE` in the script (output path is auto-generated)
+2. Run: `python feature_engineering.py`
 
 #### Output
 
-For each dataset, the pipeline generates:
-- `train_fe.csv`: Augmented training data with engineered features
-- `train_fe_meta.json`: Metadata including:
-  - Selected features and their scores
-  - Engineered column names
-  - Configuration parameters
-  - Task type (classification/regression)
+The pipeline automatically generates an output CSV file with:
+- **Path**: `data/FE_train_data/{dataset_name}/FE_{dataset_name}_train_{method}_k{top_k}_seed{seed}[_log1p].csv`
+- **Content**: Original columns + engineered columns (identifiable by name patterns: `_sq`, `_x_`, `_log1p`)
+
+**Example output paths:**
+- `data/FE_train_data/abalone/FE_abalone_train_mi_k5_seed42.csv` (without log1p)
+- `data/FE_train_data/abalone/FE_abalone_train_mi_k5_seed42_log1p.csv` (with log1p ablation)
 
 ### Example Workflow
 
@@ -153,17 +153,17 @@ For each dataset, the pipeline generates:
    python feature_engineering.py
    ```
 
-2. **Train generators** on `data/synthetic_data/feature_eng_data/<dataset>/train_fe.csv`
+2. **Train generators** on the output CSV
 
-3. **Project back to original schema** by dropping engineered columns (columns ending in `_sq`, `_x_`, `_log1p`)
+3. **Project back to original schema** by dropping engineered columns (columns ending in `_sq`, `_x_`, `_log1p`). Compare column names to the original holdout set to identify which columns to drop.
 
 4. **Evaluate** synthetic data on original feature space
 
 ## Reproducibility
 
 - Random seed: `42` (configurable via `RANDOM_SEED`)
-- All configurations saved in metadata JSON files
 - Deterministic transforms ensure consistent results
+- Configuration encoded in output filenames (e.g., `FE_abalone_train_mi_5_tier1_seed42.csv`)
 
 ## Dependencies
 
