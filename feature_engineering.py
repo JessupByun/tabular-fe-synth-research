@@ -2,9 +2,15 @@
 Feature engineering pipeline for tabular data.
 
 - Supports single-CSV processing and batch processing over many datasets.
-- Performs feature selection (MI / variance / random).
-- Applies deterministic transforms (squares, pairwise sums/products, optional log1p).
+- Performs feature selection (MI / tree/XGBoost importance / random).
+- Applies deterministic transforms (squares, pairwise products, optional log1p).
 - Writes augmented CSVs plus metadata JSON with full configuration and selected columns.
+
+Design:
+- Core method: MI with top-k numeric features (k=5)
+- Ablations: tree/XGBoost importance and random top-k
+- Transforms: squares + pairwise products on top-k numeric features (pairwise sums excluded)
+- Ablation: Full FE + log1p
 """
 
 # ============================================================================
@@ -48,10 +54,10 @@ OUTPUT_ROOT_DIR = "data/synthetic_data/feature_eng_data"  # Root directory for o
 # ----------------------------------------------------------------------------
 # Feature Selection Settings
 # ----------------------------------------------------------------------------
-# Method options: "mi" | "variance" | "random"
-#   - "mi":       Select features by mutual information with target
-#   - "variance": Select features by variance (highest variance first)
-#   - "random":   Randomly select features
+# Method options: "mi" | "tree" | "random"
+#   - "mi":    Select features by mutual information with target (core method)
+#   - "tree":  Select features by tree/XGBoost importance (ablation)
+#   - "random": Randomly select top-k features (ablation)
 FEATURE_SELECTION_METHOD = "mi"
 
 # Number of top features to select
@@ -62,30 +68,24 @@ TOP_K_NUMERIC_FEATURES = 5
 
 # Random seed for reproducibility
 # Options: int (any integer)
-#   - Used for random feature selection and sklearn's MI calculations
+#   - Used for random feature selection, tree-based models, and sklearn's MI calculations
 RANDOM_SEED = 42
 
 # ----------------------------------------------------------------------------
 # Feature Transform Settings
 # ----------------------------------------------------------------------------
 # Transform tier determines which transforms are applied
-# Options: 0 | 1 | 2
-#   - 0: No transforms (original features only)
-#   - 1: Per-feature squares only (adds x_sq for each feature x)
-#   - 2: Per-feature squares + pairwise products (adds x_sq and x_y for pairs)
-TRANSFORM_TIER = 2
+# Options: 0 | 1
+#   - 0: No transforms (original features only) - "No FE" baseline
+#   - 1: Per-feature squares + pairwise products (adds x_sq and x_y for pairs) - "Full FE"
+# Note: Pairwise sums are excluded per design
+TRANSFORM_TIER = 1
 
-# Apply log1p transform to positive values
+# Apply log1p transform to positive values (ablation)
 # Options: True | False
 #   - True:  Adds x_log1p column for each feature (only for positive values)
 #   - False: Skip log1p transform
 USE_LOG1P = False
-# Include pairwise sums in addition to products (only applies when TRANSFORM_TIER >= 2)
-# Options: True | False
-#   - True:  Adds x_plus_y columns for feature pairs
-#   - False: Only add pairwise products (x_y), not sums
-INCLUDE_PAIRWISE_SUMS = False
-# “We restrict deterministic FE to second-order polynomial expansions over the top-k numeric features (squares and pairwise products).”
 
 # ----------------------------------------------------------------------------
 # Target Column Settings
@@ -107,6 +107,13 @@ from typing import List, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
+try:
+    import xgboost as xgb
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
 
 # =========================
 # CORE HELPERS: TARGET & TASK
@@ -190,12 +197,55 @@ def rank_features_by_mi(
     return mi_series
 
 
-def rank_features_by_variance(df: pd.DataFrame, numeric_cols: List[str]) -> pd.Series:
-    """Rank numeric features by variance."""
+def rank_features_by_tree_importance(
+    df: pd.DataFrame,
+    numeric_cols: List[str],
+    target_col: str,
+    task_type: str | None = None,
+    use_xgboost: bool = True,
+) -> pd.Series:
+    """
+    Rank numeric features by tree-based importance (XGBoost or RandomForest).
+    
+    Args:
+        df: DataFrame containing features and target
+        numeric_cols: List of numeric column names to rank
+        target_col: Name of the target column
+        task_type: Optional task type ("classification" | "regression" | None).
+                   If None, auto-detects using detect_task_type().
+        use_xgboost: If True and XGBoost is available, use XGBoost; otherwise use RandomForest
+    
+    Returns:
+        Series of importance scores sorted in descending order
+    """
     if not numeric_cols:
         raise ValueError("No numeric features found to rank")
-    var_series = df[numeric_cols].var().sort_values(ascending=False)
-    return var_series
+
+    y = df[target_col]
+    X = df[numeric_cols]
+
+    # Use provided task_type or auto-detect
+    if task_type is None:
+        task_type = detect_task_type(y)
+    elif task_type not in ("classification", "regression"):
+        raise ValueError(f"Invalid task_type: {task_type}. Must be 'classification' or 'regression'.")
+
+    # Use XGBoost if available and requested, otherwise use RandomForest
+    if use_xgboost and HAS_XGBOOST:
+        if task_type == "classification":
+            model = xgb.XGBClassifier(random_state=RANDOM_SEED, n_estimators=100, verbosity=0)
+        else:
+            model = xgb.XGBRegressor(random_state=RANDOM_SEED, n_estimators=100, verbosity=0)
+    else:
+        if task_type == "classification":
+            model = RandomForestClassifier(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+        else:
+            model = RandomForestRegressor(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+
+    model.fit(X, y)
+    importance_scores = model.feature_importances_
+    importance_series = pd.Series(importance_scores, index=numeric_cols).sort_values(ascending=False)
+    return importance_series
 
 
 def select_features(
@@ -215,13 +265,13 @@ def select_features(
         numeric_cols: List of numeric column names
         target_col: Name of the target column
         method: Feature selection method
-            - "mi"       : mutual information with target
-            - "variance" : variance-based ranking
-            - "random"   : random subset of numeric_cols
+            - "mi"    : mutual information with target (core method)
+            - "tree"  : tree/XGBoost importance (ablation)
+            - "random": random subset of numeric_cols (ablation)
         top_k: Number of top features to select (None for all)
         rng: Random number generator
         task_type: Optional task type ("classification" | "regression" | None).
-                   Only used when method == "mi". If None, auto-detects.
+                   Only used when method in ("mi", "tree"). If None, auto-detects.
 
     Returns:
         selected_cols, scores_dict
@@ -231,15 +281,15 @@ def select_features(
 
     if method == "mi":
         scores = rank_features_by_mi(df, numeric_cols, target_col, task_type=task_type)
-    elif method == "variance":
-        scores = rank_features_by_variance(df, numeric_cols)
+    elif method == "tree":
+        scores = rank_features_by_tree_importance(df, numeric_cols, target_col, task_type=task_type)
     elif method == "random":
         if not numeric_cols:
             raise ValueError("No numeric features found for random selection")
         # Assign dummy scores (all equal) for completeness
         scores = pd.Series(1.0, index=numeric_cols)
     else:
-        raise ValueError(f"Unknown feature selection method: {method}")
+        raise ValueError(f"Unknown feature selection method: {method}. Must be 'mi', 'tree', or 'random'.")
 
     if method == "random":
         if top_k is None or top_k >= len(numeric_cols):
@@ -263,42 +313,40 @@ def get_transform_flags_from_tier(tier: int) -> Dict[str, bool]:
     """
     Map a transform tier to boolean flags.
 
-    Tier 0: no transforms
-    Tier 1: per-feature squares only
-    Tier 2: per-feature squares + pairwise products (and optionally sums via INCLUDE_PAIRWISE_SUMS)
+    Tier 0: no transforms (No FE baseline)
+    Tier 1: per-feature squares + pairwise products (Full FE)
+    Note: Pairwise sums are excluded per design
     """
     if tier == 0:
         return {
             "use_squares": False,
             "use_pairwise_products": False,
-            "use_pairwise_sums": False,
         }
     if tier == 1:
         return {
             "use_squares": True,
-            "use_pairwise_products": False,
-            "use_pairwise_sums": False,
-        }
-    if tier == 2:
-        return {
-            "use_squares": True,
             "use_pairwise_products": True,
-            "use_pairwise_sums": INCLUDE_PAIRWISE_SUMS,
         }
-    raise ValueError(f"Unknown transform tier: {tier}")
+    raise ValueError(f"Unknown transform tier: {tier}. Must be 0 (No FE) or 1 (Full FE).")
 
 
 def apply_deterministic_transforms(
     df: pd.DataFrame,
     cols: List[str],
     use_squares: bool,
-    use_pairwise_sums: bool,
     use_pairwise_products: bool,
     use_log1p: bool,
     log_eps: float = 1e-6,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Add engineered columns to df based on selected numeric columns.
+    
+    Transforms applied:
+    - Squares: x_sq for each feature x
+    - Pairwise products: x_y for each pair (x, y)
+    - Log1p (ablation): x_log1p for positive values only
+    
+    Note: Pairwise sums are excluded per design.
 
     Returns:
         df_augmented, engineered_column_names
@@ -322,22 +370,15 @@ def apply_deterministic_transforms(
             df.loc[positive_mask, new_col] = np.log1p(df.loc[positive_mask, c] + log_eps)
             engineered_cols.append(new_col)
 
-    # Pairwise transforms
-    n = len(cols)
-    if use_pairwise_sums or use_pairwise_products:
+    # Pairwise products (sums excluded per design)
+    if use_pairwise_products:
+        n = len(cols)
         for i in range(n):
             for j in range(i + 1, n):
                 c1, c2 = cols[i], cols[j]
-
-                if use_pairwise_sums:
-                    new_col = f"{c1}_plus_{c2}"
-                    df[new_col] = df[c1] + df[c2]
-                    engineered_cols.append(new_col)
-
-                if use_pairwise_products:
-                    new_col = f"{c1}_x_{c2}"
-                    df[new_col] = df[c1] * df[c2]
-                    engineered_cols.append(new_col)
+                new_col = f"{c1}_x_{c2}"
+                df[new_col] = df[c1] * df[c2]
+                engineered_cols.append(new_col)
 
     return df, engineered_cols
 
@@ -361,10 +402,10 @@ def run_feature_engineering_on_df(
 
     Args:
         df: DataFrame to process
-        selection_method: Feature selection method ("mi", "variance", or "random")
+        selection_method: Feature selection method ("mi", "tree", or "random")
         top_k: Number of top features to select (None for all)
-        transform_tier: Transform tier (0, 1, or 2)
-        use_log1p: Whether to apply log1p transform
+        transform_tier: Transform tier (0 for No FE, 1 for Full FE)
+        use_log1p: Whether to apply log1p transform (ablation)
         target_col_name: Name of target column (None to auto-detect)
         rng: Random number generator
         task_type: Optional task type ("classification" | "regression" | None).
@@ -397,7 +438,7 @@ def run_feature_engineering_on_df(
         method=selection_method,
         top_k=top_k,
         rng=rng,
-        task_type=task_type if selection_method == "mi" else None,
+        task_type=task_type if selection_method in ("mi", "tree") else None,
     )
 
     print(f"Selected {len(selected_cols)} feature(s) for engineering using '{selection_method}': {selected_cols}")
@@ -408,7 +449,6 @@ def run_feature_engineering_on_df(
         df=df,
         cols=selected_cols,
         use_squares=transform_flags["use_squares"],
-        use_pairwise_sums=transform_flags["use_pairwise_sums"],
         use_pairwise_products=transform_flags["use_pairwise_products"],
         use_log1p=use_log1p,
     )
