@@ -11,27 +11,25 @@ load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
 if not api_key:
     raise ValueError("GROQ_API_KEY not found in .env file.")
-client = groq.Groq(api_key=api_key)
+# Use an explicit timeout to avoid hanging requests.
+client = groq.Groq(api_key=api_key, timeout=60)
 
 # =============================
 # Configuration (edit here)
 # =============================
 CONFIG = {
-    "dataset_name": "white-wine",  # Dataset folder name under REAL_DATA_BASE
+    "dataset_name": "abalone",
+    "input_csv_path": "data/FE_train_data/abalone/FE_abalone_train_mi_k5_seed42.csv",
+    "output_csv_path": "data/synthetic_data/feature_eng_data/llama_synthetic_data/synth_abalone/synth_FE_abalone_train_mi_k5_seed42.csv",
+    # Explicit target row count for the synthetic dataset; fallback to input rows if None
+    "target_rows": None,
     "generator_name": "llama",
     "model_name": "llama-3.3-70b-versatile",
     "model_temperature": 1.0,  # Higher -> more diverse synthetic samples
-    "batch_size": 32,
-    # Input/Output base directories (must match your local layout)
-    "REAL_DATA_BASE": os.path.join("LTM_data", "LTM_real_data"),
-    "SYNTHETIC_DATA_BASE": os.path.join(
-        "LTM_data", "LTM_synthetic_data", "LTM_llama_synthetic_data"
-    ),
+    "batch_size": 200,
+    # Per-request timeout in seconds for Groq API calls
+    "request_timeout": 60,
 }
-
-# Derived path constants (do not edit unless you change structure)
-REAL_DATA_BASE = CONFIG["REAL_DATA_BASE"]
-SYNTHETIC_DATA_BASE = CONFIG["SYNTHETIC_DATA_BASE"]
 
 # Prompt template includes dataset name, summary statistics, column names, and full CSV data.
 prompt_template = (
@@ -99,25 +97,7 @@ def get_summary_statistics(df):
             }
     return json.dumps(stats, indent=2)
 
-def extract_required_n_from_filename(filename: str) -> int:
-    """
-    From something like "abalone--train--64-seed1.csv" or "iris--train--150.csv",
-    extract the number after "--train--" and before "-seed" (if present).
-    """
-    base = os.path.splitext(os.path.basename(filename))[0]
-    if "--train--" not in base:
-        return None
-    part = base.split("--train--", 1)[1]
-    if "-seed" in part:
-        num_str = part.split("-seed", 1)[0]
-    else:
-        num_str = part
-    try:
-        return int(num_str)
-    except:
-        return None
-
-def generate_synthetic_data_llama(df, dataset_name, model_name, batch_size, model_temperature):
+def generate_synthetic_data_llama(df, dataset_name, model_name, batch_size, model_temperature, request_timeout):
     """
     Generates synthetic data using the Groq API and an LLM model.
     
@@ -136,11 +116,13 @@ def generate_synthetic_data_llama(df, dataset_name, model_name, batch_size, mode
     )
     
     try:
+        print(f"[DEBUG] Calling Groq: rows={len(df)}, cols={len(df.columns)}, prompt_chars={len(prompt)}")
         response = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=model_name,
             response_format={"type": "json_object"},
-            temperature=model_temperature
+            temperature=model_temperature,
+            timeout=request_timeout,
         )
         if response.choices and len(response.choices) > 0:
             generated_text = response.choices[0].message.content
@@ -153,80 +135,85 @@ def generate_synthetic_data_llama(df, dataset_name, model_name, batch_size, mode
         print(f"Error generating data with model {model_name}: {e}")
         return None
 
-def process_csv_file_llama(input_csv, output_csv, dataset_name, model_name, model_temperature, batch_size=200):
+def process_csv_file_llama(
+    input_csv,
+    output_csv,
+    dataset_name,
+    model_name,
+    model_temperature,
+    batch_size=200,
+    target_rows=None,
+    request_timeout=60,
+):
     """
-    Loads, shuffles, batches, generates, then validates row count and re-prompts if needed.
+    Loads once, then repeatedly prompts until the synthetic row count reaches required_n.
+    Any over-generation is truncated to required_n.
     """
     df = pd.read_csv(input_csv)
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-    required_n = extract_required_n_from_filename(input_csv) or df.shape[0]
+    required_n = target_rows if target_rows is not None else df.shape[0]
 
-    synthetic_df_list = []
-    for start in range(0, df.shape[0], batch_size):
-        batch_df = df.iloc[start:start+batch_size]
-        context_df = batch_df
+    collected = []
+    attempts = 0
+    max_attempts = 50
 
-        # keep trying until we get a valid, non-empty DataFrame
-        while True:
-            synthetic_csv = generate_synthetic_data_llama(
-                batch_df, dataset_name, model_name, batch_size, model_temperature
-            )
-
-            if not synthetic_csv:
-                print(f"[WARN] No synthetic data for batch starting at {start}, retrying…")
-                time.sleep(1)
-                continue
-
-            try:
-                batch_synthetic = pd.read_csv(StringIO(synthetic_csv))
-            except Exception as e:
-                print(f"[ERROR] Couldn't parse CSV for batch at {start}: {e}, retrying…")
-                time.sleep(1)
-                continue
-
-            if batch_synthetic.empty:
-                print(f"[WARN] Empty DataFrame for batch at {start}, retrying…")
-                time.sleep(1)
-                continue
-
-            # success!
-            synthetic_df_list.append(batch_synthetic)
+    while True:
+        current_n = sum(len(chunk) for chunk in collected)
+        if current_n >= required_n:
             break
 
-    if not synthetic_df_list:
+        remaining = required_n - current_n
+        prompt_rows = min(batch_size, remaining)
+        context_df = df.sample(n=min(len(df), prompt_rows), random_state=42 + attempts)
+
+        print(f"[INFO] Generating batch attempt {attempts+1} with target {prompt_rows} rows (remaining {remaining})")
+        synthetic_csv = generate_synthetic_data_llama(
+            context_df,
+            dataset_name,
+            model_name,
+            prompt_rows,
+            model_temperature,
+            request_timeout,
+        )
+
+        if not synthetic_csv:
+            print(f"[WARN] No synthetic data returned (attempt {attempts+1}), retrying…")
+            attempts += 1
+            if attempts >= max_attempts:
+                print("[ERROR] Max attempts reached; aborting generation.")
+                break
+            time.sleep(1)
+            continue
+
+        try:
+            batch_synthetic = pd.read_csv(StringIO(synthetic_csv))
+        except Exception as e:
+            print(f"[ERROR] Couldn't parse CSV (attempt {attempts+1}): {e}, retrying…")
+            attempts += 1
+            if attempts >= max_attempts:
+                print("[ERROR] Max attempts reached; aborting generation.")
+                break
+            time.sleep(1)
+            continue
+
+        if batch_synthetic.empty:
+            print(f"[WARN] Empty DataFrame returned (attempt {attempts+1}), retrying…")
+            attempts += 1
+            if attempts >= max_attempts:
+                print("[ERROR] Max attempts reached; aborting generation.")
+                break
+            time.sleep(1)
+            continue
+
+        collected.append(batch_synthetic)
+        attempts += 1
+
+    if not collected:
         print("No synthetic data generated for file:", input_csv)
         return
 
-    synthetic_df = pd.concat(synthetic_df_list, ignore_index=True)
-
-    # refill loop: only retry up to 3 times, and require actual new rows
-    attempts = 0
-    max_attempts = 5
-    while synthetic_df.shape[0] < required_n and attempts < max_attempts:
-        needed = required_n - synthetic_df.shape[0]
-        print(f"[INFO] Reprompting for {needed} more rows (attempt {attempts+1}/{max_attempts})")
-        extra_csv = generate_synthetic_data_llama(
-            context_df, dataset_name, model_name, min(needed, batch_size), model_temperature
-        )
-        if not extra_csv:
-            print("[WARN] No data returned on reprompt, aborting.")
-            break
-        try:
-            extra_df = pd.read_csv(StringIO(extra_csv))
-        except Exception as e:
-            print(f"[ERROR] Couldn't parse reprompt batch: {e}")
-            break
-        if extra_df.empty:
-            print("[WARN] Empty DataFrame on reprompt, aborting.")
-            break
-
-        before = synthetic_df.shape[0]
-        synthetic_df = pd.concat([synthetic_df, extra_df], ignore_index=True)
-        if synthetic_df.shape[0] == before:
-            print("[WARN] Reprompt did not increase row count, aborting.")
-            break
-        attempts += 1
+    synthetic_df = pd.concat(collected, ignore_index=True)
 
     # truncate to exactly required_n (or warn if still off)
     if synthetic_df.shape[0] > required_n:
@@ -237,85 +224,36 @@ def process_csv_file_llama(input_csv, output_csv, dataset_name, model_name, mode
     synthetic_df.to_csv(output_csv, index=False)
     print(f"[INFO] Synthetic data saved to {output_csv}")
 
-def process_dataset_llama(dataset_name, generator_name, model_name, model_temperature, batch_size=200):
-    """
-    Processes all CSVs in the train folder, then runs the validation script.
-    """
-    real_data_path = os.path.join(REAL_DATA_BASE, dataset_name)
-    train_folder = os.path.join(real_data_path, "train")
-    if not os.path.isdir(train_folder):
-        print(f"[ERROR] Train folder not found: {train_folder}")
-        return
-
-    synthetic_folder = os.path.join(
-        SYNTHETIC_DATA_BASE, f"synth_{dataset_name}"
-    )
-    os.makedirs(synthetic_folder, exist_ok=True)
-
-    csv_files = [f for f in os.listdir(train_folder) if f.lower().endswith(".csv")]
-    if not csv_files:
-        print(f"[WARNING] No CSV files found in {train_folder}.")
-        return
-
-    for csv_file in csv_files:
-        input_csv = os.path.join(train_folder, csv_file)
-        base = os.path.splitext(csv_file)[0]
-        output_csv = os.path.join(synthetic_folder, f"{base}_{generator_name}_default_0.csv")
-        print(f"[INFO] Processing: {input_csv} -> {output_csv}")
-        process_csv_file_llama(
-            input_csv, output_csv,
-            dataset_name, model_name, model_temperature,
-            batch_size=batch_size
-        )
-
-    # Run validation
-    try:
-        from validate_synthetic_data import validate_synthetic_data, logger
-    except ImportError as e:
-        print(f"Error importing validation function: {e}")
-        return
-
-    args = {
-        "real_data_dir": os.path.join(real_data_path, "train"),
-        "synthetic_data_dir": synthetic_folder,
-        "output_file": os.path.join(synthetic_folder, f"{dataset_name}_validation_results.json")
-    }
-
-    validation_results = validate_synthetic_data(
-        args["real_data_dir"],
-        args["synthetic_data_dir"]
-    )
-
-    passed = sum(1 for r in validation_results if r["validation_passed"])
-    total = len(validation_results)
-    logger.info(f"Validation complete: {passed}/{total} synthetic datasets passed all checks")
-
-    for r in validation_results:
-        if not r["validation_passed"]:
-            logger.warning(f"Issues with {r['synthetic_file']}:")
-            for issue in r["issues"]:
-                logger.warning(f"  - {issue}")
-
-    try:
-        with open(args["output_file"], "w") as f:
-            json.dump(validation_results, f, indent=2)
-        logger.info(f"Validation results saved to {args['output_file']}")
-    except Exception as e:
-        logger.error(f"Error saving validation results: {e}")
-
 def main():
     dataset_name = CONFIG["dataset_name"]
+    input_csv_path = CONFIG["input_csv_path"]
+    output_csv_path = CONFIG["output_csv_path"]
+    target_rows = CONFIG["target_rows"]
+    request_timeout = CONFIG["request_timeout"]
     generator_name = CONFIG["generator_name"]
     model_name = CONFIG["model_name"]
     model_temperature = CONFIG["model_temperature"]  # Leave as 1.0 for highest diversity
     batch_size = CONFIG["batch_size"]
 
-    process_dataset_llama(
-        dataset_name,
-        generator_name=generator_name,
+    if not os.path.isfile(input_csv_path):
+        raise FileNotFoundError(f"Input CSV not found: {input_csv_path}")
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+
+    output_path = output_csv_path
+    print(f"[INFO] Processing single CSV: {input_csv_path}")
+    print(f"[INFO] Saving synthetic CSV to: {output_path}")
+
+    process_csv_file_llama(
+        input_csv=input_csv_path,
+        output_csv=output_path,
+        dataset_name=dataset_name,
         model_name=model_name,
         model_temperature=model_temperature,
-        batch_size=batch_size
+        batch_size=batch_size,
+        target_rows=target_rows,
+        request_timeout=request_timeout,
     )
 
 if __name__ == "__main__":
