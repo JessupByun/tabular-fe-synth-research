@@ -31,7 +31,7 @@ TASK_TYPE = "regression" # Options: "classification" | "regression"
 #   - "mi":    Select features by mutual information with target (core method)
 #   - "tree":  Select features by tree/XGBoost importance (ablation)
 #   - "random": Randomly select top-k features (ablation)
-FEATURE_SELECTION_METHOD = "tree"
+FEATURE_SELECTION_METHOD = "mi"
 
 # Number of top features to select
 #   - int:  Select top K features (default is 5)
@@ -84,6 +84,7 @@ def rank_features_by_mi(
     numeric_cols: List[str],
     target_col: str,
     task_type: str,
+    random_seed: int,
 ) -> pd.Series:
     """
     Rank numeric features by mutual information with the target.
@@ -93,6 +94,7 @@ def rank_features_by_mi(
         numeric_cols: List of numeric column names to rank
         target_col: Name of the target column
         task_type: Task type ("classification" | "regression") - must be specified
+        random_seed: Random seed for reproducibility
     
     Returns:
         Series of MI scores sorted in descending order
@@ -107,9 +109,9 @@ def rank_features_by_mi(
     X = df[numeric_cols]
 
     if task_type == "classification":
-        mi_scores = mutual_info_classif(X, y, discrete_features=False, random_state=0)
+        mi_scores = mutual_info_classif(X, y, discrete_features=False, random_state=random_seed)
     else:
-        mi_scores = mutual_info_regression(X, y, discrete_features=False, random_state=0)
+        mi_scores = mutual_info_regression(X, y, discrete_features=False, random_state=random_seed)
 
     mi_series = pd.Series(mi_scores, index=numeric_cols).sort_values(ascending=False)
     return mi_series
@@ -120,6 +122,7 @@ def rank_features_by_tree_importance(
     numeric_cols: List[str],
     target_col: str,
     task_type: str,
+    random_seed: int,
     use_xgboost: bool = True,
 ) -> pd.Series:
     """
@@ -130,7 +133,9 @@ def rank_features_by_tree_importance(
         numeric_cols: List of numeric column names to rank
         target_col: Name of the target column
         task_type: Task type ("classification" | "regression") - must be specified
-        use_xgboost: If True and XGBoost is available, use XGBoost; otherwise use RandomForest
+        random_seed: Random seed for reproducibility
+        use_xgboost: If True and XGBoost is available, use XGBoost for regression only;
+                     for classification, always use RandomForest (XGBoost requires encoded labels)
     
     Returns:
         Series of importance scores sorted in descending order
@@ -144,17 +149,15 @@ def rank_features_by_tree_importance(
     y = df[target_col]
     X = df[numeric_cols]
 
-    # Use XGBoost if available and requested, otherwise use RandomForest
-    if use_xgboost and HAS_XGBOOST:
-        if task_type == "classification":
-            model = xgb.XGBClassifier(random_state=RANDOM_SEED, n_estimators=100, verbosity=0)
-        else:
-            model = xgb.XGBRegressor(random_state=RANDOM_SEED, n_estimators=100, verbosity=0)
+    # For classification, always use RandomForest (XGBoost requires integer-encoded labels)
+    # For regression, use XGBoost if available and requested, otherwise use RandomForest
+    if task_type == "classification":
+        model = RandomForestClassifier(n_estimators=100, random_state=random_seed, n_jobs=-1)
     else:
-        if task_type == "classification":
-            model = RandomForestClassifier(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+        if use_xgboost and HAS_XGBOOST:
+            model = xgb.XGBRegressor(random_state=random_seed, n_estimators=100, verbosity=0)
         else:
-            model = RandomForestRegressor(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+            model = RandomForestRegressor(n_estimators=100, random_state=random_seed, n_jobs=-1)
 
     model.fit(X, y)
     importance_scores = model.feature_importances_
@@ -169,6 +172,7 @@ def select_features(
     top_k: int | None,
     rng: np.random.Generator,
     task_type: str,
+    random_seed: int,
 ) -> Tuple[List[str], Dict[str, float]]:
     """
     Select features according to the chosen method.
@@ -185,6 +189,7 @@ def select_features(
         rng: Random number generator
         task_type: Task type ("classification" | "regression") - must be specified.
                    Only used when method in ("mi", "tree").
+        random_seed: Random seed for reproducibility
 
     Returns:
         selected_cols, scores_dict
@@ -193,9 +198,9 @@ def select_features(
     scores: pd.Series
 
     if method == "mi":
-        scores = rank_features_by_mi(df, numeric_cols, target_col, task_type=task_type)
+        scores = rank_features_by_mi(df, numeric_cols, target_col, task_type=task_type, random_seed=random_seed)
     elif method == "tree":
-        scores = rank_features_by_tree_importance(df, numeric_cols, target_col, task_type=task_type)
+        scores = rank_features_by_tree_importance(df, numeric_cols, target_col, task_type=task_type, random_seed=random_seed)
     elif method == "random":
         if not numeric_cols:
             raise ValueError("No numeric features found for random selection")
@@ -261,7 +266,8 @@ def apply_deterministic_transforms(
             # Only apply log1p to positive values; others stay NaN
             new_col = f"{c}_log1p"
             positive_mask = df[c] > 0
-            df[new_col] = pd.NA
+            # Use np.nan instead of pd.NA to keep dtype numeric (float)
+            df[new_col] = np.nan
             # Use numpy for log1p
             df.loc[positive_mask, new_col] = np.log1p(df.loc[positive_mask, c] + log_eps)
             engineered_cols.append(new_col)
@@ -290,6 +296,7 @@ def run_feature_engineering_on_df(
     use_log1p: bool,
     rng: np.random.Generator,
     task_type: str,
+    random_seed: int,
 ) -> pd.DataFrame:
     """
     Run the full FE pipeline on a single DataFrame.
@@ -302,6 +309,7 @@ def run_feature_engineering_on_df(
         use_log1p: Whether to apply log1p transform (ablation)
         rng: Random number generator
         task_type: Task type ("classification" | "regression") - must be specified
+        random_seed: Random seed for reproducibility
 
     Returns:
         df_augmented: DataFrame with original and engineered columns
@@ -325,6 +333,7 @@ def run_feature_engineering_on_df(
         top_k=top_k,
         rng=rng,
         task_type=task_type,
+        random_seed=random_seed,
     )
 
     print(f"Selected {len(selected_cols)} feature(s) for engineering using '{selection_method}': {selected_cols}")
@@ -339,6 +348,13 @@ def run_feature_engineering_on_df(
     )
 
     print(f"Added {len(engineered_cols)} engineered column(s).")
+
+    # Ensure target column remains the rightmost column after transformations
+    # (engineered columns are appended to the right, so we need to move target back)
+    if target_col in df_aug.columns:
+        cols = [c for c in df_aug.columns if c != target_col]
+        cols.append(target_col)
+        df_aug = df_aug[cols]
 
     return df_aug
 
@@ -459,6 +475,7 @@ def process_csv(
         use_log1p=use_log1p,
         rng=rng,
         task_type=task_type,
+        random_seed=random_seed,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
